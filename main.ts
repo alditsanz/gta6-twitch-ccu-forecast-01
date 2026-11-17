@@ -8,8 +8,14 @@
 // over the pool and predict the target at its own hour-1 print p1, with
 // log p1 clamped to the pool's observed range (a GTA-scale hour 1 above
 // every past launch is forecast like the biggest launches, not by
-// extrapolating the slope past the data). Spread = per-hour residual SD
-// (floor 0.10 log): q_tau(h) = p1 * exp(m_h + z_tau * sigma_h).
+// extrapolating the slope past the data). Spread: the per-hour residual SD
+// (floor 0.10 log), smoothed over a flat 5-hour window (per-hour SDs from
+// 19 launches are noisy), then adjusted for heteroskedasticity — the
+// absolute residual grows as log v1 falls (slope ≈ −0.08, pooled over all
+// hours: small hour-1 launches surge unpredictably, huge ones run a flat,
+// predictable day), so sigma_h += slope * (log p1 − mean log v1):
+// intervals widen for a quiet hour 1 and narrow for a huge one.
+// q_tau(h) = p1 * exp(m_h + z_tau * sigma_h).
 //
 // Pool: tier "comparable", complete 24 h curve, v1 >= 5% of the launch's
 // own peak (rolling-midnight unlocks; drops simultaneous-global unlocks
@@ -19,8 +25,8 @@
 // crashes, never emits an invalid case.
 //
 // Local validation (practice launches' real SullyGnome release days):
-// loss 0.181 vs house baseline 0.387; leave-one-out over 19 rolling
-// launches 0.262 vs 0.403.
+// loss 0.176 vs house baseline 0.387; leave-one-out over 19 rolling
+// launches 0.258 vs 0.403.
 //
 // Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input), writes <id>.out
 // to $MAKEFUN_OUTPUT_DIR (else /output): {"hours":[{"hour":2,"q":[q05,
@@ -93,16 +99,38 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
   const xs = pool.map((e) => Math.log(e.curve.v1));
   const lo = Math.min(...xs), hi = Math.max(...xs);
   const logP1 = Math.min(Math.max(Math.log(p1), lo), hi);
-  return c.forecast.map(({ hour: h }) => {
+  // First pass: per-hour OLS centre, residuals, raw spread.
+  const fits = c.forecast.map(({ hour: h }) => {
     const ys = pool.map((e) => Math.log(e.curve.byHour[h - 1] / e.curve.v1));
     const [a, b, mx, my] = ols(xs, ys);
     const m = my + b * (logP1 - mx);
     const resid = ys.map((y, i) => y - (a + b * xs[i]));
     const rm = resid.reduce((s, v) => s + v, 0) / resid.length;
     const sigma = Math.max(SIG_FLOOR, Math.sqrt(resid.reduce((s, v) => s + (v - rm) * (v - rm), 0) / resid.length));
-    const q = Z.map((z) => Math.min(1e9, Math.max(0.01, r2(p1 * Math.exp(m + z * sigma)))));
-    for (let i = 1; i < q.length; i++) if (q[i] < q[i - 1]) q[i] = q[i - 1]; // keep quantiles non-decreasing
-    return { hour: h, q };
+    return { hour: h, m, mx, resid, sigma };
+  });
+  // Spread, smoothed over a flat 5-hour window (neighbours in hour order).
+  const smooth = fits.map((f, i) => {
+    let s = 0, n = 0;
+    for (let j = Math.max(0, i - 2); j <= Math.min(fits.length - 1, i + 2); j++) { s += fits[j].sigma; n++; }
+    return s / n;
+  });
+  // Pooled slope of |residual| on centred log v1 (heteroskedasticity).
+  const mx = fits[0].mx;
+  let meanAbs = 0, cnt = 0;
+  for (const f of fits) for (const r of f.resid) { meanAbs += Math.abs(r); cnt++; }
+  meanAbs /= cnt;
+  let num = 0, den = 0;
+  for (const f of fits) for (let i = 0; i < xs.length; i++) {
+    const dx = xs[i] - mx;
+    num += dx * (Math.abs(f.resid[i]) - meanAbs); den += dx * dx;
+  }
+  const het = den > 0 ? num / den : 0;
+  return fits.map((f, i) => {
+    const sigma = Math.max(SIG_FLOOR, smooth[i] + het * (logP1 - mx));
+    const q = Z.map((z) => Math.min(1e9, Math.max(0.01, r2(p1 * Math.exp(f.m + z * sigma)))));
+    for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1]; // keep quantiles non-decreasing
+    return { hour: f.hour, q };
   });
 }
 
