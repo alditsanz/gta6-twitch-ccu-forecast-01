@@ -17,16 +17,22 @@
 // pre-midnight hours instead dilutes this to noise; the single last hour
 // is the signal.) Both regressors are centred, so the fit never shifts
 // the level when a slope is shrunk or a regressor drops out.
-// The forecast is the average of TWO centres, each with the same spread,
-// because the centres disagree exactly where the data is thinnest and
-// averaging cuts the variance:
+// The forecast is the weighted average of TWO centres, each with the same
+// spread, because the centres disagree exactly where the data is thinnest
+// and averaging cuts the variance. The robust member carries the larger
+// weight (0.75) — it wins on both practice and leave-one-out:
 //  (1) a big-launch blend: the full-pool centre averaged 50/50 with a
-//      centre fitted only on the top half of the pool by v1 (big
-//      launches behave differently — their evening surge is stronger
-//      than the full-pool line says);
-//  (2) a Huber (k = 2.0) robust centre: downweights the pool's oddballs
-//      (a launch carried by a handful of huge channels, or an extreme
-//      ratio) instead of letting them drag the line.
+//      centre fitted only on the top three-quarters of the pool by v1
+//      (threshold at the 33rd percentile — big launches behave
+//      differently: their evening surge is stronger than the full-pool
+//      line says);
+//  (2) a Huber (k = 1.345, the 95%-efficiency value) robust centre:
+//      downweights the pool's oddballs (a launch carried by a handful
+//      of huge channels, or an extreme ratio) instead of letting them
+//      drag the line.
+// All per-hour regression slopes are smoothed [1,2,1] across hours
+// (centred form, so the level never moves): a single hour's fit on 19
+// launches is noisy, and neighbouring hours share the same shape.
 // If the case carries no usable pre-midnight print (no history, or a pool
 // member with no pre-day hour), the second regressor is dropped and the
 // centres fall back to the one-regressor form — same forecast as v6.
@@ -49,8 +55,8 @@
 // crashes, never emits an invalid case.
 //
 // Local validation (practice launches' real SullyGnome release days):
-// loss 0.152 vs house baseline 0.387; leave-one-out over 19 rolling
-// launches 0.250 vs 0.403.
+// loss 0.148 vs house baseline 0.387; leave-one-out over 19 rolling
+// launches 0.248 vs 0.403.
 //
 // Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input), writes <id>.out
 // to $MAKEFUN_OUTPUT_DIR (else /output): {"hours":[{"hour":2,"q":[q05,
@@ -69,8 +75,11 @@ const SIG_FLOOR = 0.1; // floor on the per-hour log spread
 const SIG_MULT = 0.93; // normal shape overstates the tails (measured)
 const HET_UP = 1.75; // asymmetric het: upper tail takes 1.75x pooled slope
 const HET_DN = 0.5; // lower tail takes 0.5x (surges go up, not down)
-const HUBER_K = 2.0; // Huber IRLS tuning constant for the robust centre
+const HUBER_K = 1.345; // Huber IRLS tuning constant (95%-efficiency value)
 const BIG_W = 0.5; // weight of the big-launch centre in the blend
+const BIG_Q = 0.33; // big pool: v1 at/above this quantile of the pool
+const W_BLEND = 0.25; // ensemble weight of the big-launch blend member
+const W_HUBER = 0.75; // ensemble weight of the Huber robust member
 
 interface Row { from: string; viewers: number }
 interface Comp { day_start: string; unlock?: string; hourly: Row[] }
@@ -260,14 +269,56 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
   const x2 = pool.map((e) => Math.log(Math.max(1, e.curve.preLast) / e.curve.v1));
   const usePre = preTgt > 0 && pool.every((e) => e.curve.preLast > 0);
   const t2 = usePre ? Math.log(preTgt / p1) : 0;
-  // First pass: per-hour raw OLS fits, residuals, raw spread.
+  // Big-launch pool: v1 at/above the BIG_Q quantile of the pool.
+  const sortedXs = [...xs].sort((a, b) => a - b);
+  const thr = sortedXs[Math.floor(BIG_Q * (xs.length - 1))];
+  const bigIdx = xs.map((x, i) => (x >= thr ? i : -1)).filter((i) => i >= 0);
+  // First pass: per-hour fits — 1-var OLS for the spread, and centre
+  // coefficients: two-regressor when the pre-midnight print is usable,
+  // one-regressor (b2 = 0) otherwise, so one centre formula serves both.
   const fits = c.forecast.map(({ hour: h }) => {
     const ys = pool.map((e) => Math.log(e.curve.byHour[h - 1] / e.curve.v1));
     const [a, b, mx, my] = ols(xs, ys);
     const resid = ys.map((y, i) => y - (a + b * xs[i]));
     const rm = resid.reduce((s, v) => s + v, 0) / resid.length;
     const sigma = Math.max(SIG_FLOOR, Math.sqrt(resid.reduce((s, v) => s + (v - rm) * (v - rm), 0) / resid.length));
-    return { hour: h, b, mx, my, ys, resid, sigma };
+    let b1 = b, b2 = 0, m1 = mx, m2 = 0, my2 = my;
+    let hb1 = huberSlope(xs, ys), hb2 = 0;
+    let big: [number, number, number, number, number] | null = null;
+    if (usePre) {
+      const [, c1, c2, n1, n2, ny] = ols2(xs, x2, ys);
+      b1 = c1; b2 = c2; m1 = n1; m2 = n2; my2 = ny;
+      [hb1, hb2] = huberSlopes2(xs, x2, ys);
+    }
+    if (bigIdx.length >= 2) {
+      if (usePre) {
+        const [, d1, d2, e1, e2, ey] = ols2(
+          bigIdx.map((j) => xs[j]), bigIdx.map((j) => x2[j]), bigIdx.map((j) => ys[j]));
+        big = [d1, d2, e1, e2, ey];
+      } else {
+        const [, d1, dmx, dmy] = ols(bigIdx.map((j) => xs[j]), bigIdx.map((j) => ys[j]));
+        big = [d1, 0, dmx, 0, dmy];
+      }
+    }
+    return { hour: h, b1, b2, m1, m2, my2, hb1, hb2, big, ys, resid, sigma };
+  });
+  // Slope smoothing [1,2,1] across hours: per-hour coefficients fitted on
+  // 19 launches are noisy; the centred form keeps the level untouched.
+  const sm121 = (vs: number[]): number[] => vs.map((_, i) => {
+    let s = 0, w = 0;
+    for (let j = -1; j <= 1; j++) {
+      const k = i + j;
+      if (k >= 0 && k < vs.length) { const wt = j === 0 ? 2 : 1; s += wt * vs[k]; w += wt; }
+    }
+    return s / w;
+  });
+  const sB1 = sm121(fits.map((f) => f.b1)), sB2 = sm121(fits.map((f) => f.b2));
+  const sH1 = sm121(fits.map((f) => f.hb1)), sH2 = sm121(fits.map((f) => f.hb2));
+  const sG1 = sm121(fits.map((f) => (f.big ? f.big[0] : 0)));
+  const sG2 = sm121(fits.map((f) => (f.big ? f.big[1] : 0)));
+  fits.forEach((f, i) => {
+    f.b1 = sB1[i]; f.b2 = sB2[i]; f.hb1 = sH1[i]; f.hb2 = sH2[i];
+    if (f.big) f.big = [sG1[i], sG2[i], f.big[2], f.big[3], f.big[4]];
   });
   // Spread, smoothed over a flat 7-hour window (neighbours in hour order).
   const smooth = fits.map((f, i) => {
@@ -276,7 +327,7 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     return s / n;
   });
   // Pooled slope of |residual| on centred log v1 (heteroskedasticity).
-  const mx = fits[0].mx;
+  const mx = fits[0].m1; // mean log v1 (same in the 1-var and 2-var fits)
   let meanAbs = 0, cnt = 0;
   for (const f of fits) for (const r of f.resid) { meanAbs += Math.abs(r); cnt++; }
   meanAbs /= cnt;
@@ -286,10 +337,6 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     num += dx * (Math.abs(f.resid[i]) - meanAbs); den += dx * dx;
   }
   const het = den > 0 ? num / den : 0;
-  // Big-launch pool: the top half of the pool by log v1.
-  const sortedXs = [...xs].sort((a, b) => a - b);
-  const thr = sortedXs[Math.floor(0.5 * (xs.length - 1))];
-  const bigIdx = xs.map((x, i) => (x >= thr ? i : -1)).filter((i) => i >= 0);
   // One model's five quantiles from a centre m (same spread for both).
   const quantiles = (m: number, i: number): number[] => {
     const sig = Math.max(SIG_FLOOR, smooth[i] * SIG_MULT);
@@ -303,35 +350,18 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     return q;
   };
   return fits.map((f, i) => {
-    const mFull = f.my + f.b * (logP1 - f.mx);
+    const mOls = f.my2 + f.b1 * (logP1 - f.m1) + f.b2 * (t2 - f.m2);
     // Big-launch centre (falls back to the full-pool centre if too small).
-    let mBig = mFull;
-    if (bigIdx.length >= 2) {
-      const [, bb, bmx, bmy] = ols(bigIdx.map((j) => xs[j]), bigIdx.map((j) => f.ys[j]));
-      mBig = bmy + bb * (logP1 - bmx);
+    let mBig = mOls;
+    if (f.big) {
+      const [bb1, bb2, bm1, bm2, bmy2] = f.big;
+      mBig = bmy2 + bb1 * (logP1 - bm1) + bb2 * (t2 - bm2);
     }
-    const mBlend = (1 - BIG_W) * mFull + BIG_W * mBig;
-    const mHuber = f.my + huberSlope(xs, f.ys) * (logP1 - f.mx);
-    let qA = quantiles(mBlend, i);
-    let qB = quantiles(mHuber, i);
-    if (usePre) {
-      // Two-regressor centres: same blend + Huber structure, with the
-      // pre-midnight regressor added (centred on its own pool mean).
-      const [, b1, b2, m1, m2, my2] = ols2(xs, x2, f.ys);
-      const mOls2 = my2 + b1 * (logP1 - m1) + b2 * (t2 - m2);
-      let mBig2 = mOls2;
-      if (bigIdx.length >= 2) {
-        const [, bb1, bb2, bm1, bm2, bmy2] = ols2(
-          bigIdx.map((j) => xs[j]), bigIdx.map((j) => x2[j]), bigIdx.map((j) => f.ys[j]));
-        mBig2 = bmy2 + bb1 * (logP1 - bm1) + bb2 * (t2 - bm2);
-      }
-      const mBlend2 = (1 - BIG_W) * mOls2 + BIG_W * mBig2;
-      const [hb1, hb2] = huberSlopes2(xs, x2, f.ys);
-      const mHuber2 = my2 + hb1 * (logP1 - m1) + hb2 * (t2 - m2);
-      qA = quantiles(mBlend2, i);
-      qB = quantiles(mHuber2, i);
-    }
-    const q = qA.map((v, j) => r2((v + qB[j]) / 2));
+    const mBlend = (1 - BIG_W) * mOls + BIG_W * mBig;
+    const mHuber = f.my2 + f.hb1 * (logP1 - f.m1) + f.hb2 * (t2 - f.m2);
+    const qA = quantiles(mBlend, i);
+    const qB = quantiles(mHuber, i);
+    const q = qA.map((v, j) => r2(W_BLEND * v + W_HUBER * qB[j]));
     for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1];
     return { hour: f.hour, q };
   });

@@ -31,13 +31,18 @@ the target at its own hour-1 print, log-clamped to the pool's range. The
 second regressor is the launch's own state just before midnight — `pre` is
 the viewers in the last recorded hour before the release day — which says
 where the launch sits on its early-unlock surge-decay at 00:00 UTC. The
-forecast is the average of two centres (same spread for both): a big-launch
-blend — the full-pool centre averaged 50/50 with a centre fitted only on
-the top half of the pool by `v1`, because big launches' evening surge runs
-stronger than the full-pool line says — and a Huber (k = 2.0) robust centre
-that downweights the pool's oddballs instead of letting them drag the line.
+forecast is the weighted average of two centres (same spread for both):
+a big-launch blend — the full-pool centre averaged 50/50 with a centre
+fitted only on the top three-quarters of the pool by `v1` (threshold at
+the 33rd percentile), because big launches' evening surge runs stronger
+than the full-pool line says — and a Huber (k = 1.345) robust centre that
+downweights the pool's oddballs instead of letting them drag the line.
+The robust member carries the larger weight (0.75). All per-hour
+regression slopes are smoothed [1,2,1] across hours (centred form, so
+the level never moves): a single hour's fit on 19 launches is noisy.
 If a case carries no usable pre-midnight print the second regressor drops
-out and the forecast is exactly the v6 one-regressor form. The spread is
+out and the centres fall back to the one-regressor form (same smoothed
+slopes, same weights). The spread is
 the per-hour residual SD (floor 0.10 log), smoothed over a flat 7-hour
 window, scaled 0.93 (the normal shape overstates the tails), and adjusted
 for heteroskedasticity — small hour-1 launches surge unpredictably, huge
@@ -56,16 +61,16 @@ averages, the public source the kit cites):
 
 | case | this entry | house baseline |
 |---|---|---|
-| Marvel's Wolverine | 0.180 | 0.744 |
-| Red Dead Redemption 2 | 0.143 | 0.287 |
+| Marvel's Wolverine | 0.170 | 0.744 |
+| Red Dead Redemption 2 | 0.138 | 0.287 |
 | God of War Ragnarök | 0.104 | 0.215 |
 | Marvel's Spider-Man 2 | 0.181 | 0.303 |
-| **mean pinball loss** | **0.152** | **0.387** |
+| **mean pinball loss** | **0.148** | **0.387** |
 
-90% coverage 0.957, typical miss 24.3%. Leave-one-out over the 19 rolling
-tier-comparable launches: 0.250 versus 0.403 for the baseline (90% coverage
-0.849). Two runs on
-the practice cases are byte-identical; one run takes ~1.9 s for all four
+90% coverage 0.946, typical miss 23.4%. Leave-one-out over the 19 rolling
+tier-comparable launches: 0.248 versus 0.403 for the baseline (90% coverage
+0.856). Two runs on
+the practice cases are byte-identical; one run takes ~1.6 s for all four
 cases (cap is 8 s per case).
 
 ## License
