@@ -1,23 +1,35 @@
 // gta6-twitch-ccu-forecast-01 — launch-day Twitch CCU forecaster (Node 22+, stdlib only, no network).
 //
-// Method: per-hour log-ratio OLS on the case's own comparables. For a past
+// Method: per-hour log-ratio regression on the case's own comparables. For a past
 // launch with a complete release-day curve, hour-1 viewers v1 predict the
 // rest: log(peak/v1) correlates -0.82 with log(v1) (a huge hour 1 stays
 // flat; a quiet one explodes by daytime). So per hour h = 2..24 fit
-//   ln(v_h/v1) = a_h + b_h * ln(v1)
+//   ln(v_h/v1) = a_h + b_h * ln(v1) + c_h * ln(pre/v1)
 // over the pool and predict the target at its own hour-1 print p1, with
 // log p1 clamped to the pool's observed range (a GTA-scale hour 1 above
 // every past launch is forecast like the biggest launches, not by
-// extrapolating the slope past the data). The forecast is the average of
-// TWO centres, each with the same spread, because the centres disagree
-// exactly where the data is thinnest and averaging cuts the variance:
-//  (1) a big-launch blend: the full-pool OLS centre averaged 50/50 with
-//      an OLS centre fitted only on the top half of the pool by v1 (big
+// extrapolating the slope past the data). The second regressor is the
+// launch's OWN state just before midnight: pre = viewers in the last
+// recorded hour before the release day starts, so ln(pre/v1) says where
+// the launch sits on its early-unlock surge-decay at 00:00 UTC — a launch
+// whose pre-midnight surge is still high decays differently through the
+// day than one whose surge already spent itself. (Averaging the last 3-6
+// pre-midnight hours instead dilutes this to noise; the single last hour
+// is the signal.) Both regressors are centred, so the fit never shifts
+// the level when a slope is shrunk or a regressor drops out.
+// The forecast is the average of TWO centres, each with the same spread,
+// because the centres disagree exactly where the data is thinnest and
+// averaging cuts the variance:
+//  (1) a big-launch blend: the full-pool centre averaged 50/50 with a
+//      centre fitted only on the top half of the pool by v1 (big
 //      launches behave differently — their evening surge is stronger
 //      than the full-pool line says);
 //  (2) a Huber (k = 2.0) robust centre: downweights the pool's oddballs
 //      (a launch carried by a handful of huge channels, or an extreme
 //      ratio) instead of letting them drag the line.
+// If the case carries no usable pre-midnight print (no history, or a pool
+// member with no pre-day hour), the second regressor is dropped and the
+// centres fall back to the one-regressor form — same forecast as v6.
 // Spread: the per-hour residual SD (floor 0.10 log), smoothed over a flat
 // 7-hour window (per-hour SDs from 19 launches are noisy), scaled 0.93
 // (the normal shape overstates the tails: narrower intervals win on both
@@ -37,8 +49,8 @@
 // crashes, never emits an invalid case.
 //
 // Local validation (practice launches' real SullyGnome release days):
-// loss 0.166 vs house baseline 0.387; leave-one-out over 19 rolling
-// launches 0.254 vs 0.403.
+// loss 0.152 vs house baseline 0.387; leave-one-out over 19 rolling
+// launches 0.250 vs 0.403.
 //
 // Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input), writes <id>.out
 // to $MAKEFUN_OUTPUT_DIR (else /output): {"hours":[{"hour":2,"q":[q05,
@@ -62,8 +74,9 @@ const BIG_W = 0.5; // weight of the big-launch centre in the blend
 
 interface Row { from: string; viewers: number }
 interface Comp { day_start: string; unlock?: string; hourly: Row[] }
-interface Case { id: string; levels: number[]; known: { hour: number; viewers: number }[]; forecast: { hour: number }[]; comparables?: Comp[] }
-interface Curve { v1: number; peak: number; byHour: number[] }
+interface HistPt { at: string; viewers: number }
+interface Case { id: string; levels: number[]; day_start?: string; known: { hour: number; viewers: number }[]; history?: HistPt[]; forecast: { hour: number }[]; comparables?: Comp[] }
+interface Curve { v1: number; peak: number; byHour: number[]; preLast: number }
 
 const r2 = (x: number) => Math.round(x * 100) / 100;
 
@@ -72,20 +85,29 @@ const tierOf = (c: Comp) =>
   /Tier:\s*([^.\n]+)/.exec(c.unlock ?? "")?.[1].trim().toLowerCase() ?? "comparable";
 
 // One comparable's release-day curve (viewers, hours 1..24), else null
-// when incomplete (a missing hour, or a non-positive hour 1).
+// when incomplete (a missing hour, or a non-positive hour 1). preLast is
+// the viewers at the last recorded hour before the release day starts
+// (0 when the comparable has no pre-day hour).
 function dayCurve(c: Comp): Curve | null {
   const start = Date.parse(c.day_start);
   if (!Number.isFinite(start)) return null;
   const byHour = new Array(24).fill(0);
   let seen = 0;
+  let preAt = -Infinity, preLast = 0;
   for (const r of c.hourly ?? []) {
-    const h = Math.floor((Date.parse(r.from) - start) / 3_600_000) + 1;
-    if (!(h >= 1 && h <= 24) || typeof r.viewers !== "number" || !Number.isFinite(r.viewers)) continue;
+    const t = Date.parse(r.from);
+    if (!Number.isFinite(t) || typeof r.viewers !== "number" || !Number.isFinite(r.viewers)) continue;
+    if (t < start) {
+      if (t > preAt) { preAt = t; preLast = r.viewers; }
+      continue;
+    }
+    const h = Math.floor((t - start) / 3_600_000) + 1;
+    if (!(h >= 1 && h <= 24)) continue;
     if (byHour[h - 1] === 0) seen++;
     byHour[h - 1] = r.viewers;
   }
   if (seen !== 24 || byHour[0] <= 0) return null;
-  return { v1: byHour[0], peak: Math.max(...byHour), byHour };
+  return { v1: byHour[0], peak: Math.max(...byHour), byHour, preLast };
 }
 
 // OLS of y on x -> [intercept, slope, meanX, meanY]; predict centred,
@@ -97,6 +119,25 @@ function ols(xs: number[], ys: number[]): [number, number, number, number] {
   for (let i = 0; i < n; i++) { sxx += (xs[i] - mx) * (xs[i] - mx); sxy += (xs[i] - mx) * (ys[i] - my); }
   const b = sxx > 0 ? sxy / sxx : 0;
   return [my - b * mx, b, mx, my];
+}
+
+// Two-regressor OLS y ~ 1 + x1 + x2 -> [intercept, b1, b2, meanX1, meanX2, meanY].
+// The second regressor is ln(pre/v1): small and only weakly collinear with
+// ln(v1), so the 2x2 system stays well conditioned; a degenerate system
+// falls back to the intercept-only fit instead of blowing up.
+function ols2(xs1: number[], xs2: number[], ys: number[]): [number, number, number, number, number, number] {
+  const n = xs1.length;
+  const m1 = xs1.reduce((a, b) => a + b, 0) / n, m2 = xs2.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let s11 = 0, s22 = 0, s12 = 0, s1y = 0, s2y = 0;
+  for (let i = 0; i < n; i++) {
+    const d1 = xs1[i] - m1, d2 = xs2[i] - m2, dy = ys[i] - my;
+    s11 += d1 * d1; s22 += d2 * d2; s12 += d1 * d2; s1y += d1 * dy; s2y += d2 * dy;
+  }
+  const det = s11 * s22 - s12 * s12;
+  if (Math.abs(det) < 1e-12) return [my, 0, 0, m1, m2, my];
+  const b1 = (s1y * s22 - s2y * s12) / det, b2 = (s2y * s11 - s1y * s12) / det;
+  return [my - b1 * m1 - b2 * m2, b1, b2, m1, m2, my];
 }
 
 const median = (vs: number[]): number => {
@@ -121,6 +162,24 @@ function wols(xs: number[], ys: number[], w: number[]): [number, number] {
   return [my - b * mx, b];
 }
 
+// Weighted two-regressor OLS -> [intercept, b1, b2].
+function wols2(xs1: number[], xs2: number[], ys: number[], w: number[]): [number, number, number] {
+  const sw = w.reduce((a, b) => a + b, 0);
+  const m1 = xs1.reduce((s, x, i) => s + w[i] * x, 0) / sw;
+  const m2 = xs2.reduce((s, x, i) => s + w[i] * x, 0) / sw;
+  const my = ys.reduce((s, y, i) => s + w[i] * y, 0) / sw;
+  let s11 = 0, s22 = 0, s12 = 0, s1y = 0, s2y = 0;
+  for (let i = 0; i < xs1.length; i++) {
+    const d1 = xs1[i] - m1, d2 = xs2[i] - m2, dy = ys[i] - my;
+    s11 += w[i] * d1 * d1; s22 += w[i] * d2 * d2; s12 += w[i] * d1 * d2;
+    s1y += w[i] * d1 * dy; s2y += w[i] * d2 * dy;
+  }
+  const det = s11 * s22 - s12 * s12;
+  if (Math.abs(det) < 1e-12) return [my, 0, 0];
+  const b1 = (s1y * s22 - s2y * s12) / det, b2 = (s2y * s11 - s1y * s12) / det;
+  return [my - b1 * m1 - b2 * m2, b1, b2];
+}
+
 // Huber IRLS slope (k = HUBER_K, scale 1.4826*MAD, pstdev fallback),
 // starting from OLS, at most 20 iterations, tol 1e-8. Deterministic.
 function huberSlope(xs: number[], ys: number[]): number {
@@ -143,6 +202,42 @@ function huberSlope(xs: number[], ys: number[]): number {
   return b;
 }
 
+// Huber IRLS slopes for the two-regressor fit -> [b1, b2]; the centre
+// reuses the OLS means, as in huberSlope above.
+function huberSlopes2(xs1: number[], xs2: number[], ys: number[]): [number, number] {
+  let [, b1, b2] = ols2(xs1, xs2, ys);
+  let a = ols2(xs1, xs2, ys)[0];
+  for (let it = 0; it < 20; it++) {
+    const r = ys.map((y, i) => y - (a + b1 * xs1[i] + b2 * xs2[i]));
+    const med = median(r);
+    let s = 1.4826 * median(r.map((v) => Math.abs(v - med)));
+    if (s === 0) s = pstdev(r);
+    if (s === 0) s = 1;
+    const w = r.map((v) => {
+      const u = v / (HUBER_K * s);
+      return Math.abs(u) <= 1 ? 1 : 1 / Math.abs(u);
+    });
+    const [na, nb1, nb2] = wols2(xs1, xs2, ys, w);
+    const d = Math.max(Math.abs(na - a), Math.abs(nb1 - b1), Math.abs(nb2 - b2));
+    a = na; b1 = nb1; b2 = nb2;
+    if (d < 1e-8) break;
+  }
+  return [b1, b2];
+}
+
+// Last recorded history point strictly before the release day starts.
+function preLastOf(c: Case): number {
+  const start = Date.parse(c.day_start ?? "");
+  if (!Number.isFinite(start)) return 0;
+  let preAt = -Infinity, pre = 0;
+  for (const p of c.history ?? []) {
+    const t = Date.parse(p.at);
+    if (!Number.isFinite(t) || t >= start || typeof p.viewers !== "number" || !Number.isFinite(p.viewers)) continue;
+    if (t > preAt) { preAt = t; pre = p.viewers; }
+  }
+  return pre;
+}
+
 function forecastCase(c: Case): { hour: number; q: number[] }[] {
   const first = c.known.find((k) => k.hour === 1);
   if (first === undefined) throw new Error(`${c.id} has no hour-1 print`);
@@ -160,6 +255,11 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
   const xs = pool.map((e) => Math.log(e.curve.v1));
   const lo = Math.min(...xs), hi = Math.max(...xs);
   const logP1 = Math.min(Math.max(Math.log(p1), lo), hi);
+  // Second regressor: the target's own pre-midnight state, and the pool's.
+  const preTgt = preLastOf(c);
+  const x2 = pool.map((e) => Math.log(Math.max(1, e.curve.preLast) / e.curve.v1));
+  const usePre = preTgt > 0 && pool.every((e) => e.curve.preLast > 0);
+  const t2 = usePre ? Math.log(preTgt / p1) : 0;
   // First pass: per-hour raw OLS fits, residuals, raw spread.
   const fits = c.forecast.map(({ hour: h }) => {
     const ys = pool.map((e) => Math.log(e.curve.byHour[h - 1] / e.curve.v1));
@@ -212,8 +312,25 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     }
     const mBlend = (1 - BIG_W) * mFull + BIG_W * mBig;
     const mHuber = f.my + huberSlope(xs, f.ys) * (logP1 - f.mx);
-    const qA = quantiles(mBlend, i);
-    const qB = quantiles(mHuber, i);
+    let qA = quantiles(mBlend, i);
+    let qB = quantiles(mHuber, i);
+    if (usePre) {
+      // Two-regressor centres: same blend + Huber structure, with the
+      // pre-midnight regressor added (centred on its own pool mean).
+      const [, b1, b2, m1, m2, my2] = ols2(xs, x2, f.ys);
+      const mOls2 = my2 + b1 * (logP1 - m1) + b2 * (t2 - m2);
+      let mBig2 = mOls2;
+      if (bigIdx.length >= 2) {
+        const [, bb1, bb2, bm1, bm2, bmy2] = ols2(
+          bigIdx.map((j) => xs[j]), bigIdx.map((j) => x2[j]), bigIdx.map((j) => f.ys[j]));
+        mBig2 = bmy2 + bb1 * (logP1 - bm1) + bb2 * (t2 - bm2);
+      }
+      const mBlend2 = (1 - BIG_W) * mOls2 + BIG_W * mBig2;
+      const [hb1, hb2] = huberSlopes2(xs, x2, f.ys);
+      const mHuber2 = my2 + hb1 * (logP1 - m1) + hb2 * (t2 - m2);
+      qA = quantiles(mBlend2, i);
+      qB = quantiles(mHuber2, i);
+    }
     const q = qA.map((v, j) => r2((v + qB[j]) / 2));
     for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1];
     return { hour: f.hour, q };

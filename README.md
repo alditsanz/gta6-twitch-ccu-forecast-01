@@ -22,27 +22,32 @@ mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
 ## Method
 
-Per-hour log-ratio OLS on the case's own comparables — the full write-up is
+Per-hour log-ratio regression on the case's own comparables — the full write-up is
 the header comment in `main.ts`. In short: for each past big launch with a
 complete release-day curve, hour-1 viewers `v1` predict the rest of the day
 (`log(peak/v1)` correlates −0.82 with `log(v1)`), so per hour `h = 2..24` the
-program fits `ln(v_h/v1) = a_h + b_h * ln(v1)` and predicts the target at its
-own hour-1 print, log-clamped to the pool's range. The forecast is the
-average of two centres (same spread for both): a big-launch blend — the
-full-pool OLS centre averaged 50/50 with an OLS centre fitted only on the
-top half of the pool by `v1`, because big launches' evening surge runs
+program fits `ln(v_h/v1) = a_h + b_h * ln(v1) + c_h * ln(pre/v1)` and predicts
+the target at its own hour-1 print, log-clamped to the pool's range. The
+second regressor is the launch's own state just before midnight — `pre` is
+the viewers in the last recorded hour before the release day — which says
+where the launch sits on its early-unlock surge-decay at 00:00 UTC. The
+forecast is the average of two centres (same spread for both): a big-launch
+blend — the full-pool centre averaged 50/50 with a centre fitted only on
+the top half of the pool by `v1`, because big launches' evening surge runs
 stronger than the full-pool line says — and a Huber (k = 2.0) robust centre
 that downweights the pool's oddballs instead of letting them drag the line.
-The spread is the per-hour residual SD (floor 0.10 log), smoothed over a
-flat 7-hour window, scaled 0.93 (the normal shape overstates the tails),
-and adjusted for heteroskedasticity — small hour-1 launches surge
-unpredictably, huge ones run a flat predictable day, so the spread widens
-for a quiet hour 1 and narrows for a huge one (pooled slope of |residual|
-on centred log v1 ≈ −0.08) — asymmetrically: the upper tail takes 1.75x
-the slope, the lower tail 0.5x, because surges go up, not down. Pool: tier
-`comparable`, complete 24 h curve, `v1` ≥ 5% of the launch's own peak.
-Fallbacks loosen the pool, then the house persistence baseline — never
-crashes, never emits an invalid case.
+If a case carries no usable pre-midnight print the second regressor drops
+out and the forecast is exactly the v6 one-regressor form. The spread is
+the per-hour residual SD (floor 0.10 log), smoothed over a flat 7-hour
+window, scaled 0.93 (the normal shape overstates the tails), and adjusted
+for heteroskedasticity — small hour-1 launches surge unpredictably, huge
+ones run a flat predictable day, so the spread widens for a quiet hour 1
+and narrows for a huge one (pooled slope of |residual| on centred log v1
+≈ −0.08) — asymmetrically: the upper tail takes 1.75x the slope, the lower
+tail 0.5x, because surges go up, not down. Pool: tier `comparable`,
+complete 24 h curve, `v1` ≥ 5% of the launch's own peak. Fallbacks loosen
+the pool, then the house persistence baseline — never crashes, never emits
+an invalid case.
 
 ## Local validation
 
@@ -51,16 +56,16 @@ averages, the public source the kit cites):
 
 | case | this entry | house baseline |
 |---|---|---|
-| Marvel's Wolverine | 0.220 | 0.744 |
-| Red Dead Redemption 2 | 0.152 | 0.287 |
-| God of War Ragnarök | 0.111 | 0.215 |
-| Marvel's Spider-Man 2 | 0.180 | 0.303 |
-| **mean pinball loss** | **0.166** | **0.387** |
+| Marvel's Wolverine | 0.180 | 0.744 |
+| Red Dead Redemption 2 | 0.143 | 0.287 |
+| God of War Ragnarök | 0.104 | 0.215 |
+| Marvel's Spider-Man 2 | 0.181 | 0.303 |
+| **mean pinball loss** | **0.152** | **0.387** |
 
-90% coverage 0.957, typical miss 28.8%. Leave-one-out over the 19 rolling
-tier-comparable launches: 0.254 versus 0.403 for the baseline (90% coverage
-0.858 vs 0.867 before — intervals stay calibrated). Two runs on
-the practice cases are byte-identical; one run takes ~1.7 s for all four
+90% coverage 0.957, typical miss 24.3%. Leave-one-out over the 19 rolling
+tier-comparable launches: 0.250 versus 0.403 for the baseline (90% coverage
+0.849). Two runs on
+the practice cases are byte-identical; one run takes ~1.9 s for all four
 cases (cap is 8 s per case).
 
 ## License
