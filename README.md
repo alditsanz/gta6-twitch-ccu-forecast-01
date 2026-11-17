@@ -22,27 +22,15 @@ mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
 ## Method
 
-Per-hour log-ratio regression on the case's own comparables. For each past
-big launch with a complete release-day curve, hour 1's viewers `v1` predict
-the rest of the day: `log(peak/v1)` correlates −0.82 with `log(v1)` across
-the kit's comparables — a launch whose hour 1 is already huge stays flat,
-a quiet hour 1 explodes by daytime. So for each hour `h = 2..24` the program
-fits the OLS line `ln(v_h / v1) = a_h + b_h * ln(v1)` over the comparable
-launches and predicts the target at its own hour-1 print `p1` (log-clamped
-to the pool's observed range, so a GTA-scale hour 1 above every past launch
-is forecast like the biggest launches, not by extrapolating the slope past
-the data). The spread is the per-hour residual standard deviation (floored
-at 0.10 log units): `q_tau(h) = p1 * exp(m_h + z_tau * sigma_h)`.
-
-The pool is only launches that look like this one: tier `comparable`,
-a complete 24-hour release-day curve, and `v1` at least 5% of the launch's
-own peak (rolling-midnight unlocks — hour 1 already holds the UK/EU
-midnight audience). That cut drops simultaneous-global unlocks, whose hour 1
-is still pre-unlock and whose ratios explode 100x+, and the tier cut drops
-early-access, free-to-play and the GTA VI pre-release history rows.
-Fallbacks loosen the pool, and with no usable curve at all the program falls
-back to the house persistence baseline — it never crashes and never emits
-an invalid case. Deterministic: no randomness, no network, no clock.
+Per-hour log-ratio OLS on the case's own comparables — the full write-up is
+the header comment in `main.ts`. In short: for each past big launch with a
+complete release-day curve, hour-1 viewers `v1` predict the rest of the day
+(`log(peak/v1)` correlates −0.82 with `log(v1)`), so per hour `h = 2..24` the
+program fits `ln(v_h/v1) = a_h + b_h * ln(v1)` and predicts the target at its
+own hour-1 print, log-clamped to the pool's range; the spread is the per-hour
+residual SD (floor 0.10 log). Pool: tier `comparable`, complete 24 h curve,
+`v1` ≥ 5% of the launch's own peak. Fallbacks loosen the pool, then the house
+persistence baseline — never crashes, never emits an invalid case.
 
 ## Local validation
 
