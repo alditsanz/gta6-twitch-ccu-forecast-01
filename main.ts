@@ -10,7 +10,10 @@
 //
 //     ln(v_h / v1) = a_h + b_h * ln(v1)
 //
-//   and predict the target launch at its own hour-1 print p1. The spread is
+//   and predict the target launch at its own hour-1 print p1, with p1's
+//   log clamped to the pool's observed range (so a GTA-scale hour 1 above
+//   every past launch is forecast like the biggest launches, not by
+//   extrapolating the fitted slope past the data). The spread is
 //   the per-hour residual standard deviation (floored at 0.10 log units), so
 //   q_tau(h) = p1 * exp(m_h + z_tau * sigma_h) with z the standard normal
 //   quantiles at the five scored levels. The median curve this gives is the
@@ -173,7 +176,17 @@ function forecastCase(c: Case): Array<{ hour: number; q: number[] }> {
   }
 
   const xs = pool.map((e) => Math.log(e.curve.v1));
-  const logP1 = Math.log(p1);
+  // Clamp the target's log hour-1 to the pool's observed range. GTA VI's
+  // hour 1 will plausibly be 0.5-2M viewers, above the largest pool launch
+  // (ELDEN RING, 875k): the fitted slope (-0.46 per log unit) extrapolated
+  // past the data would predict an evening median of 0.56x hour 1 at
+  // v1 = 2M — a declining day no big launch in the data shows (ELDEN RING
+  // stayed at 1.00x its hour 1). Clamping holds the forecast at the
+  // biggest-launch behaviour (0.82x at hour 19) instead of inventing one.
+  const logP1 = Math.min(
+    Math.max(Math.log(p1), Math.min(...xs)),
+    Math.max(...xs),
+  );
 
   return c.forecast.map(({ hour: h }) => {
     const ys = pool.map((e) => Math.log(e.curve.byHour[h - 1] / e.curve.v1));
