@@ -9,13 +9,16 @@
 // log p1 clamped to the pool's observed range (a GTA-scale hour 1 above
 // every past launch is forecast like the biggest launches, not by
 // extrapolating the slope past the data). Spread: the per-hour residual SD
-// (floor 0.10 log), smoothed over a flat 5-hour window (per-hour SDs from
-// 19 launches are noisy), then adjusted for heteroskedasticity — the
-// absolute residual grows as log v1 falls (slope ≈ −0.08, pooled over all
-// hours: small hour-1 launches surge unpredictably, huge ones run a flat,
-// predictable day), so sigma_h += slope * (log p1 − mean log v1):
-// intervals widen for a quiet hour 1 and narrow for a huge one.
-// q_tau(h) = p1 * exp(m_h + z_tau * sigma_h).
+// (floor 0.10 log), smoothed over a flat 7-hour window (per-hour SDs from
+// 19 launches are noisy), scaled 0.93 (the normal shape overstates the
+// tails: narrower intervals win on both practice and leave-one-out), then
+// adjusted for heteroskedasticity — the absolute residual grows as log v1
+// falls (slope ≈ −0.08, pooled over all hours). The adjustment is
+// ASYMMETRIC: surges go up, so the upper tail widens 1.75x the pooled
+// slope for a quiet hour 1 while the lower tail only 0.5x. Centre: the
+// per-hour slopes are smoothed [1,2,1] across hours (the day curve is
+// smooth; raw per-hour slopes are noisy). q_tau(h) = p1 * exp(m_h +
+// z_tau * sigma_h), sigma_h upper/lower by the sign of z_tau.
 //
 // Pool: tier "comparable", complete 24 h curve, v1 >= 5% of the launch's
 // own peak (rolling-midnight unlocks; drops simultaneous-global unlocks
@@ -25,8 +28,8 @@
 // crashes, never emits an invalid case.
 //
 // Local validation (practice launches' real SullyGnome release days):
-// loss 0.176 vs house baseline 0.387; leave-one-out over 19 rolling
-// launches 0.258 vs 0.403.
+// loss 0.169 vs house baseline 0.387; leave-one-out over 19 rolling
+// launches 0.255 vs 0.403.
 //
 // Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input), writes <id>.out
 // to $MAKEFUN_OUTPUT_DIR (else /output): {"hours":[{"hour":2,"q":[q05,
@@ -42,6 +45,9 @@ const Z = [-1.645, -0.674, 0, 0.674, 1.645]; // standard normal quantiles
 const MIN_POOL = 5; // minimum pool size before a fallback tier kicks in
 const ROLL_MIN = 0.05; // rolling-midnight launch: v1 >= this fraction of its own peak
 const SIG_FLOOR = 0.1; // floor on the per-hour log spread
+const SIG_MULT = 0.93; // normal shape overstates the tails (measured)
+const HET_UP = 1.75; // asymmetric het: upper tail takes 1.75x pooled slope
+const HET_DN = 0.5; // lower tail takes 0.5x (surges go up, not down)
 
 interface Row { from: string; viewers: number }
 interface Comp { day_start: string; unlock?: string; hourly: Row[] }
@@ -99,20 +105,31 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
   const xs = pool.map((e) => Math.log(e.curve.v1));
   const lo = Math.min(...xs), hi = Math.max(...xs);
   const logP1 = Math.min(Math.max(Math.log(p1), lo), hi);
-  // First pass: per-hour OLS centre, residuals, raw spread.
+  // First pass: per-hour OLS, residuals, raw spread (centre follows after
+  // slope smoothing, so m is computed below, not here).
   const fits = c.forecast.map(({ hour: h }) => {
     const ys = pool.map((e) => Math.log(e.curve.byHour[h - 1] / e.curve.v1));
     const [a, b, mx, my] = ols(xs, ys);
-    const m = my + b * (logP1 - mx);
     const resid = ys.map((y, i) => y - (a + b * xs[i]));
     const rm = resid.reduce((s, v) => s + v, 0) / resid.length;
     const sigma = Math.max(SIG_FLOOR, Math.sqrt(resid.reduce((s, v) => s + (v - rm) * (v - rm), 0) / resid.length));
-    return { hour: h, m, mx, resid, sigma };
+    return { hour: h, b, mx, my, resid, sigma };
   });
-  // Spread, smoothed over a flat 5-hour window (neighbours in hour order).
+  // Centre slopes smoothed [1,2,1] across hours (edges renormalised).
+  const ms = fits.map((f, i) => {
+    let s = 0, w = 0;
+    for (let j = -1; j <= 1; j++) {
+      const k = i + j;
+      if (k < 0 || k >= fits.length) continue;
+      const wt = j === 0 ? 2 : 1;
+      s += wt * fits[k].b; w += wt;
+    }
+    return f.my + (s / w) * (logP1 - f.mx);
+  });
+  // Spread, smoothed over a flat 7-hour window (neighbours in hour order).
   const smooth = fits.map((f, i) => {
     let s = 0, n = 0;
-    for (let j = Math.max(0, i - 2); j <= Math.min(fits.length - 1, i + 2); j++) { s += fits[j].sigma; n++; }
+    for (let j = Math.max(0, i - 3); j <= Math.min(fits.length - 1, i + 3); j++) { s += fits[j].sigma; n++; }
     return s / n;
   });
   // Pooled slope of |residual| on centred log v1 (heteroskedasticity).
@@ -127,8 +144,13 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
   }
   const het = den > 0 ? num / den : 0;
   return fits.map((f, i) => {
-    const sigma = Math.max(SIG_FLOOR, smooth[i] + het * (logP1 - mx));
-    const q = Z.map((z) => Math.min(1e9, Math.max(0.01, r2(p1 * Math.exp(f.m + z * sigma)))));
+    const sig = Math.max(SIG_FLOOR, smooth[i] * SIG_MULT);
+    const sigUp = Math.max(SIG_FLOOR, sig + HET_UP * het * (logP1 - mx));
+    const sigDn = Math.max(SIG_FLOOR, sig + HET_DN * het * (logP1 - mx));
+    const q = Z.map((z) => {
+      const s = z > 0 ? sigUp : z < 0 ? sigDn : sig;
+      return Math.min(1e9, Math.max(0.01, r2(p1 * Math.exp(ms[i] + z * s))));
+    });
     for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1]; // keep quantiles non-decreasing
     return { hour: f.hour, q };
   });
