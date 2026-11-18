@@ -17,13 +17,15 @@
 // pre-midnight hours instead dilutes this to noise; the single last hour
 // is the signal.) Both regressors are centred, so the fit never shifts
 // the level when a slope is shrunk or a regressor drops out.
-// The forecast is the MEDIAN of THREE centres' quantiles, each with the
+// The forecast is the MEDIAN of FIVE centres' quantiles, each with the
 // same spread — median-of-quantiles (Vincentization with the median), so a
 // single member's bad extrapolation can never drag a quantile with it:
 // the median is the middle member at each (hour, tau), not an average.
-// The three members are two 2-regressor centres (v8) plus one 1-regressor
+// The five members are two 2-regressor centres (v8) plus one 1-regressor
 // centre (the v6 structure, no pre-midnight regressor, raw slopes, big
-// pool = top half by v1, Huber k = 1.345):
+// pool = top half by v1, Huber k = 1.345) plus two DIVERSE centres that
+// only joined at v12, each measured to improve BOTH practice and
+// leave-one-out as a median member:
 //  (1) a big-launch blend: the full-pool centre averaged 50/50 with a
 //      centre fitted only on the top three-quarters of the pool by v1
 //      (threshold at the 33rd percentile — big launches behave
@@ -39,6 +41,28 @@
 //      for the plain launch-size shape. The mean of the three members'
 //      quantiles does NOT win (practice worse); the median does — the
 //      mechanism is robustness, not just a third vote.
+//  (4) a ridge-interaction centre: the 2-regressor OLS member refitted
+//      with a third regressor, the centred interaction
+//      (ln v1 − mean)(ln(pre/v1) − mean), under ridge (lambda = 0.5 on
+//      standardised regressors). The interaction alone hits practice
+//      0.140 in plain OLS but is leave-one-out poison (0.269); ridge
+//      tames it (0.146/0.250 standalone), and as a median member it is
+//      the middle vote in ~31% of cells. Its blend is the same 50/50
+//      full/big shape as (1), its Huber leg is the standard 2-var Huber,
+//      and the two legs combine 0.25/0.75 exactly as v8 did.
+//  (5) a quantile-regression median centre: the tau = 0.5 fit (least
+//      absolute deviations) of the same two regressors, solved by
+//      iteratively reweighted least squares — the L1 centre, which
+//      ignores the pool's outliers entirely instead of downweighting
+//      them, and which improves leave-one-out at every blend weight
+//      (but costs practice as a blend member; as a median member it
+//      wins on both). Its slopes are NOT smoothed across hours: the
+//      exact-LP version and this IRLS version give identical practice
+//      and leave-one-out scores (verified in Python before porting).
+// The interaction's target value uses the CLAMPED log hour-1 (unlike the
+// Python experiment, which used the raw print): on every measured case
+// the clamp never binds, so the numbers are identical, and a GTA-scale
+// hour 1 can no longer blow the interaction term up by extrapolation.
 // All per-hour regression slopes of the 2-regressor members are smoothed
 // [1,2,1] across hours (centred form, so the level never moves): a single
 // hour's fit on 19 launches is noisy, and neighbouring hours share the
@@ -65,8 +89,8 @@
 // crashes, never emits an invalid case.
 //
 // Local validation (practice launches' real SullyGnome release days):
-// loss 0.147 vs house baseline 0.387; leave-one-out over 19 rolling
-// launches 0.247 vs 0.403.
+// loss 0.146 vs house baseline 0.387; leave-one-out over 19 rolling
+// launches 0.246 vs 0.403.
 //
 // Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input), writes <id>.out
 // to $MAKEFUN_OUTPUT_DIR (else /output): {"hours":[{"hour":2,"q":[q05,
@@ -88,6 +112,10 @@ const HET_DN = 0.5; // lower tail takes 0.5x (surges go up, not down)
 const HUBER_K = 1.345; // Huber IRLS tuning constant (95%-efficiency value)
 const BIG_W = 0.5; // weight of the big-launch centre in the blend
 const BIG_Q = 0.33; // big pool: v1 at/above this quantile of the pool
+const RIDGE_LAM = 0.5; // ridge penalty on standardised regressors (member 4)
+const LAD_EPS = 1e-4; // IRLS weight floor for the median (L1) centre
+const LAD_ITERS = 100; // IRLS iterations cap for the median centre
+const LAD_TOL = 1e-10; // IRLS convergence tolerance (max coefficient move)
 
 interface Row { from: string; viewers: number }
 interface Comp { day_start: string; unlock?: string; hourly: Row[] }
@@ -242,6 +270,85 @@ function huberSlopes2(xs1: number[], xs2: number[], ys: number[]): [number, numb
   return [b1, b2];
 }
 
+// Solve a 3x3 system by Gaussian elimination with partial pivoting.
+// Returns [0,0,0] only if a pivot is (numerically) zero.
+function solve3(A: number[][], b: number[]): [number, number, number] {
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < 3; c++) {
+    let p = c;
+    for (let r = c + 1; r < 3; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-12) return [0, 0, 0];
+    if (p !== c) { const t = M[c]; M[c] = M[p]; M[p] = t; }
+    for (let r = c + 1; r < 3; r++) {
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k < 4; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  const x = [0, 0, 0];
+  for (let r = 2; r >= 0; r--) {
+    let s = M[r][3];
+    for (let k = r + 1; k < 3; k++) s -= M[r][k] * x[k];
+    x[r] = s / M[r][r];
+  }
+  return [x[0], x[1], x[2]];
+}
+
+// Ridge on centred + standardised regressors (3 columns) -> slopes in
+// the original units, plus the y mean. The penalty is lam on the
+// standardised scale, so lam ~ O(1) is meaningful whatever n is.
+function ridge3(cols: number[][], ys: number[]): [number, number, number, number] {
+  const n = ys.length;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  const means = cols.map((c) => c.reduce((a, b) => a + b, 0) / n);
+  const sds = cols.map((c, j) => {
+    const sd = Math.sqrt(c.reduce((s, v) => s + (v - means[j]) * (v - means[j]), 0) / n);
+    return sd > 0 ? sd : 1;
+  });
+  const A: number[][] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  const rhs = [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    const z = cols.map((c, j) => (c[i] - means[j]) / sds[j]);
+    const dy = ys[i] - my;
+    for (let a = 0; a < 3; a++) {
+      rhs[a] += z[a] * dy;
+      for (let b = 0; b < 3; b++) A[a][b] += z[a] * z[b];
+    }
+  }
+  for (let a = 0; a < 3; a++) A[a][a] += RIDGE_LAM;
+  const bs = solve3(A, rhs);
+  return [bs[0] / sds[0], bs[1] / sds[1], bs[2] / sds[2], my];
+}
+
+// Least-absolute-deviations slopes for the two-regressor fit -> [b1, b2];
+// the centre reuses the OLS means, as in huberSlopes2 above. IRLS with
+// weights 1/max(|r|, LAD_EPS), starting from OLS, at most LAD_ITERS
+// iterations, tol LAD_TOL. Deterministic.
+function ladSlopes2(xs1: number[], xs2: number[], ys: number[]): [number, number] {
+  let [, b1, b2, m1, m2, my] = ols2(xs1, xs2, ys);
+  let a = my - b1 * m1 - b2 * m2;
+  for (let it = 0; it < LAD_ITERS; it++) {
+    const w = ys.map((y, i) => 1 / Math.max(Math.abs(y - (a + b1 * xs1[i] + b2 * xs2[i])), LAD_EPS));
+    const [na, nb1, nb2] = wols2(xs1, xs2, ys, w);
+    const d = Math.max(Math.abs(na - a), Math.abs(nb1 - b1), Math.abs(nb2 - b2));
+    a = na; b1 = nb1; b2 = nb2;
+    if (d < LAD_TOL) break;
+  }
+  return [b1, b2];
+}
+
+// One-regressor LAD slope (no-pre fallback path), same IRLS skeleton.
+function ladSlope(xs: number[], ys: number[]): number {
+  let [a, b] = ols(xs, ys);
+  for (let it = 0; it < LAD_ITERS; it++) {
+    const w = ys.map((y, i) => 1 / Math.max(Math.abs(y - (a + b * xs[i])), LAD_EPS));
+    const [na, nb] = wols(xs, ys, w);
+    const d = Math.max(Math.abs(na - a), Math.abs(nb - b));
+    a = na; b = nb;
+    if (d < LAD_TOL) break;
+  }
+  return b;
+}
+
 // Last recorded history point strictly before the release day starts.
 function preLastOf(c: Case): number {
   const start = Date.parse(c.day_start ?? "");
@@ -277,6 +384,15 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
   const x2 = pool.map((e) => Math.log(Math.max(1, e.curve.preLast) / e.curve.v1));
   const usePre = preTgt > 0 && pool.every((e) => e.curve.preLast > 0);
   const t2 = usePre ? Math.log(preTgt / p1) : 0;
+  // Third regressor (member 4): the centred interaction of the two
+  // regressors; the target's value uses the clamped log hour-1, so a
+  // GTA-scale hour 1 cannot blow it up by extrapolation (on every
+  // measured case the clamp never binds, so this matches the Python
+  // experiment exactly).
+  const meanX1 = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const meanX2 = x2.reduce((a, b) => a + b, 0) / x2.length;
+  const x3 = xs.map((x, i) => (x - meanX1) * (x2[i] - meanX2));
+  const t3 = (logP1 - meanX1) * (t2 - meanX2);
   // Big-launch pool: v1 at/above the BIG_Q quantile of the pool.
   const sortedXs = [...xs].sort((a, b) => a - b);
   const thr = sortedXs[Math.floor(BIG_Q * (xs.length - 1))];
@@ -319,7 +435,29 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
         big = [d1, 0, dmx, 0, dmy];
       }
     }
-    return { hour: h, b1, b2, m1, m2, my2, hb1, hb2, big, ys, resid, sigma, bRaw: b, mx1: mx, my1: my, hbRaw, big6 };
+    // Member 4 (ridge interaction): 3-var ridge on (x1, x2, x3), full
+    // pool and big pool; skipped when the pre regressor is unusable
+    // (the member then votes with member 1 instead). Member 5 (LAD
+    // median): raw slopes, never smoothed.
+    let r1 = 0, r2 = 0, r3 = 0, rm1 = meanX1, rm2 = meanX2, rmy = my2;
+    let rm3 = x3.reduce((a, b) => a + b, 0) / x3.length;
+    let rbig: [number, number, number, number, number, number, number] | null = null;
+    if (usePre) {
+      [r1, r2, r3, rmy] = ridge3([xs, x2, x3], ys);
+      if (bigIdx.length >= 2) {
+        const [rb1, rb2, rb3, rbmy] = ridge3(
+          [bigIdx.map((j) => xs[j]), bigIdx.map((j) => x2[j]), bigIdx.map((j) => x3[j])],
+          bigIdx.map((j) => ys[j]));
+        rbig = [rb1, rb2, rb3,
+          bigIdx.reduce((s, j) => s + xs[j], 0) / bigIdx.length,
+          bigIdx.reduce((s, j) => s + x2[j], 0) / bigIdx.length,
+          bigIdx.reduce((s, j) => s + x3[j], 0) / bigIdx.length, rbmy];
+      }
+    }
+    let lad1: number, lad2: number;
+    if (usePre) [lad1, lad2] = ladSlopes2(xs, x2, ys);
+    else { lad1 = ladSlope(xs, ys); lad2 = 0; }
+    return { hour: h, b1, b2, m1, m2, my2, hb1, hb2, big, ys, resid, sigma, bRaw: b, mx1: mx, my1: my, hbRaw, big6, r1, r2, r3, rm1, rm2, rm3, rmy, rbig, lad1, lad2 };
   });
   // Slope smoothing [1,2,1] across hours: per-hour coefficients fitted on
   // 19 launches are noisy; the centred form keeps the level untouched.
@@ -335,9 +473,15 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
   const sH1 = sm121(fits.map((f) => f.hb1)), sH2 = sm121(fits.map((f) => f.hb2));
   const sG1 = sm121(fits.map((f) => (f.big ? f.big[0] : 0)));
   const sG2 = sm121(fits.map((f) => (f.big ? f.big[1] : 0)));
+  const sR1 = sm121(fits.map((f) => f.r1)), sR2 = sm121(fits.map((f) => f.r2)), sR3 = sm121(fits.map((f) => f.r3));
+  const sGR1 = sm121(fits.map((f) => (f.rbig ? f.rbig[0] : 0)));
+  const sGR2 = sm121(fits.map((f) => (f.rbig ? f.rbig[1] : 0)));
+  const sGR3 = sm121(fits.map((f) => (f.rbig ? f.rbig[2] : 0)));
   fits.forEach((f, i) => {
     f.b1 = sB1[i]; f.b2 = sB2[i]; f.hb1 = sH1[i]; f.hb2 = sH2[i];
     if (f.big) f.big = [sG1[i], sG2[i], f.big[2], f.big[3], f.big[4]];
+    f.r1 = sR1[i]; f.r2 = sR2[i]; f.r3 = sR3[i];
+    if (f.rbig) f.rbig = [sGR1[i], sGR2[i], sGR3[i], f.rbig[3], f.rbig[4], f.rbig[5], f.rbig[6]];
   });
   // Spread, smoothed over a flat 7-hour window (neighbours in hour order).
   const smooth = fits.map((f, i) => {
@@ -380,6 +524,26 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     const mHuber = f.my2 + f.hb1 * (logP1 - f.m1) + f.hb2 * (t2 - f.m2);
     const qA = quantiles(mBlend, i);
     const qB = quantiles(mHuber, i);
+    // Fourth member: ridge-interaction centre — its blend leg (0.25)
+    // against the standard Huber leg (0.75), exactly as v8 weighted
+    // them; without a usable pre regressor it votes with member (1).
+    let qRidge = qA;
+    if (usePre) {
+      let mRidge = f.rmy + f.r1 * (logP1 - f.rm1) + f.r2 * (t2 - f.rm2) + f.r3 * (t3 - f.rm3);
+      if (f.rbig) {
+        const [rb1, rb2, rb3, rbm1, rbm2, rbm3, rbmy] = f.rbig;
+        const mRidgeBig = rbmy + rb1 * (logP1 - rbm1) + rb2 * (t2 - rbm2) + rb3 * (t3 - rbm3);
+        mRidge = (1 - BIG_W) * mRidge + BIG_W * mRidgeBig;
+      }
+      const qRA = quantiles(mRidge, i);
+      qRidge = qRA.map((v, j) => r2(0.25 * v + 0.75 * qB[j]));
+      for (let j = 1; j < qRidge.length; j++) if (qRidge[j] < qRidge[j - 1]) qRidge[j] = qRidge[j - 1];
+    }
+    // Fifth member: LAD median centre (raw slopes), same spread.
+    const mQR = usePre
+      ? f.my2 + f.lad1 * (logP1 - f.m1) + f.lad2 * (t2 - f.m2)
+      : f.my1 + f.lad1 * (logP1 - f.mx1);
+    const qQR = quantiles(mQR, i);
     // Third member: the 1-regressor v6 centre (raw slopes, top-half big
     // pool, 50/50 blend + Huber, same spread) — its own two quantiles
     // averaged, as v6 did.
@@ -394,10 +558,10 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     const q6A = quantiles(mBlend6, i);
     const q6B = quantiles(mHuber6, i);
     const q6 = q6A.map((v, j) => r2((v + q6B[j]) / 2));
-    // Median of the three members' quantiles, per level: the middle
+    // Median of the five members' quantiles, per level: the middle
     // member wins each (hour, tau), so one member's bad extrapolation
     // can never drag a quantile with it.
-    const q = qA.map((v, j) => [v, qB[j], q6[j]].sort((x, y) => x - y)[1]);
+    const q = qA.map((v, j) => [v, qB[j], q6[j], qRidge[j], qQR[j]].sort((x, y) => x - y)[2]);
     for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1];
     return { hour: f.hour, q };
   });
