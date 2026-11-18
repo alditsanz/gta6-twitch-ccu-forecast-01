@@ -17,10 +17,13 @@
 // pre-midnight hours instead dilutes this to noise; the single last hour
 // is the signal.) Both regressors are centred, so the fit never shifts
 // the level when a slope is shrunk or a regressor drops out.
-// The forecast is the weighted average of TWO centres, each with the same
-// spread, because the centres disagree exactly where the data is thinnest
-// and averaging cuts the variance. The robust member carries the larger
-// weight (0.75) — it wins on both practice and leave-one-out:
+// The forecast is the MEDIAN of THREE centres' quantiles, each with the
+// same spread — median-of-quantiles (Vincentization with the median), so a
+// single member's bad extrapolation can never drag a quantile with it:
+// the median is the middle member at each (hour, tau), not an average.
+// The three members are two 2-regressor centres (v8) plus one 1-regressor
+// centre (the v6 structure, no pre-midnight regressor, raw slopes, big
+// pool = top half by v1, Huber k = 1.345):
 //  (1) a big-launch blend: the full-pool centre averaged 50/50 with a
 //      centre fitted only on the top three-quarters of the pool by v1
 //      (threshold at the 33rd percentile — big launches behave
@@ -29,10 +32,17 @@
 //  (2) a Huber (k = 1.345, the 95%-efficiency value) robust centre:
 //      downweights the pool's oddballs (a launch carried by a handful
 //      of huge channels, or an extreme ratio) instead of letting them
-//      drag the line.
-// All per-hour regression slopes are smoothed [1,2,1] across hours
-// (centred form, so the level never moves): a single hour's fit on 19
-// launches is noisy, and neighbouring hours share the same shape.
+//      drag the line;
+//  (3) the 1-regressor v6 centre: same two shapes as (1)+(2) but on
+//      ln(v1) alone — it has no pre-midnight regressor, so where the
+//      2-regressor members extrapolate on a strange ln(pre/v1) it votes
+//      for the plain launch-size shape. The mean of the three members'
+//      quantiles does NOT win (practice worse); the median does — the
+//      mechanism is robustness, not just a third vote.
+// All per-hour regression slopes of the 2-regressor members are smoothed
+// [1,2,1] across hours (centred form, so the level never moves): a single
+// hour's fit on 19 launches is noisy, and neighbouring hours share the
+// same shape. The v6 member keeps raw slopes (as v6 did).
 // If the case carries no usable pre-midnight print (no history, or a pool
 // member with no pre-day hour), the second regressor is dropped and the
 // centres fall back to the one-regressor form — same forecast as v6.
@@ -55,8 +65,8 @@
 // crashes, never emits an invalid case.
 //
 // Local validation (practice launches' real SullyGnome release days):
-// loss 0.148 vs house baseline 0.387; leave-one-out over 19 rolling
-// launches 0.248 vs 0.403.
+// loss 0.147 vs house baseline 0.387; leave-one-out over 19 rolling
+// launches 0.247 vs 0.403.
 //
 // Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input), writes <id>.out
 // to $MAKEFUN_OUTPUT_DIR (else /output): {"hours":[{"hour":2,"q":[q05,
@@ -78,8 +88,6 @@ const HET_DN = 0.5; // lower tail takes 0.5x (surges go up, not down)
 const HUBER_K = 1.345; // Huber IRLS tuning constant (95%-efficiency value)
 const BIG_W = 0.5; // weight of the big-launch centre in the blend
 const BIG_Q = 0.33; // big pool: v1 at/above this quantile of the pool
-const W_BLEND = 0.25; // ensemble weight of the big-launch blend member
-const W_HUBER = 0.75; // ensemble weight of the Huber robust member
 
 interface Row { from: string; viewers: number }
 interface Comp { day_start: string; unlock?: string; hourly: Row[] }
@@ -273,6 +281,9 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
   const sortedXs = [...xs].sort((a, b) => a - b);
   const thr = sortedXs[Math.floor(BIG_Q * (xs.length - 1))];
   const bigIdx = xs.map((x, i) => (x >= thr ? i : -1)).filter((i) => i >= 0);
+  // v6 member's big pool: top half by v1 (quantile 0.5, as v6 did).
+  const thr6 = sortedXs[Math.floor(0.5 * (xs.length - 1))];
+  const bigIdx6 = xs.map((x, i) => (x >= thr6 ? i : -1)).filter((i) => i >= 0);
   // First pass: per-hour fits — 1-var OLS for the spread, and centre
   // coefficients: two-regressor when the pre-midnight print is usable,
   // one-regressor (b2 = 0) otherwise, so one centre formula serves both.
@@ -283,7 +294,15 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     const rm = resid.reduce((s, v) => s + v, 0) / resid.length;
     const sigma = Math.max(SIG_FLOOR, Math.sqrt(resid.reduce((s, v) => s + (v - rm) * (v - rm), 0) / resid.length));
     let b1 = b, b2 = 0, m1 = mx, m2 = 0, my2 = my;
-    let hb1 = huberSlope(xs, ys), hb2 = 0;
+    // v6 member (1-var, raw slopes): keep the 1-var fit before the
+    // 2-regressor override below, plus its top-half big-pool centre.
+    const hbRaw = huberSlope(xs, ys);
+    let hb1 = hbRaw, hb2 = 0;
+    let big6: [number, number, number] | null = null;
+    if (bigIdx6.length >= 2) {
+      const [, d1, dmx, dmy] = ols(bigIdx6.map((j) => xs[j]), bigIdx6.map((j) => ys[j]));
+      big6 = [d1, dmx, dmy];
+    }
     let big: [number, number, number, number, number] | null = null;
     if (usePre) {
       const [, c1, c2, n1, n2, ny] = ols2(xs, x2, ys);
@@ -300,7 +319,7 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
         big = [d1, 0, dmx, 0, dmy];
       }
     }
-    return { hour: h, b1, b2, m1, m2, my2, hb1, hb2, big, ys, resid, sigma };
+    return { hour: h, b1, b2, m1, m2, my2, hb1, hb2, big, ys, resid, sigma, bRaw: b, mx1: mx, my1: my, hbRaw, big6 };
   });
   // Slope smoothing [1,2,1] across hours: per-hour coefficients fitted on
   // 19 launches are noisy; the centred form keeps the level untouched.
@@ -337,7 +356,7 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     num += dx * (Math.abs(f.resid[i]) - meanAbs); den += dx * dx;
   }
   const het = den > 0 ? num / den : 0;
-  // One model's five quantiles from a centre m (same spread for both).
+  // One model's five quantiles from a centre m (same spread for all members).
   const quantiles = (m: number, i: number): number[] => {
     const sig = Math.max(SIG_FLOOR, smooth[i] * SIG_MULT);
     const sigUp = Math.max(SIG_FLOOR, sig + HET_UP * het * (logP1 - mx));
@@ -361,7 +380,24 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     const mHuber = f.my2 + f.hb1 * (logP1 - f.m1) + f.hb2 * (t2 - f.m2);
     const qA = quantiles(mBlend, i);
     const qB = quantiles(mHuber, i);
-    const q = qA.map((v, j) => r2(W_BLEND * v + W_HUBER * qB[j]));
+    // Third member: the 1-regressor v6 centre (raw slopes, top-half big
+    // pool, 50/50 blend + Huber, same spread) — its own two quantiles
+    // averaged, as v6 did.
+    const mFull6 = f.my1 + f.bRaw * (logP1 - f.mx1);
+    let mBig6 = mFull6;
+    if (f.big6) {
+      const [bb6, bm6, by6] = f.big6;
+      mBig6 = by6 + bb6 * (logP1 - bm6);
+    }
+    const mBlend6 = 0.5 * mFull6 + 0.5 * mBig6;
+    const mHuber6 = f.my1 + f.hbRaw * (logP1 - f.mx1);
+    const q6A = quantiles(mBlend6, i);
+    const q6B = quantiles(mHuber6, i);
+    const q6 = q6A.map((v, j) => r2((v + q6B[j]) / 2));
+    // Median of the three members' quantiles, per level: the middle
+    // member wins each (hour, tau), so one member's bad extrapolation
+    // can never drag a quantile with it.
+    const q = qA.map((v, j) => [v, qB[j], q6[j]].sort((x, y) => x - y)[1]);
     for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1];
     return { hour: f.hour, q };
   });
